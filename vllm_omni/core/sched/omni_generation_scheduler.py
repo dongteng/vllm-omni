@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
+import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -57,6 +59,24 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
         self._pending_finish_reqs: list[Request] = []
         self._pending_chunk_error_outputs: list[tuple[int, EngineCoreOutput]] = []
+
+        self._first_chunk_express = os.environ.get("VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS") == "1"
+        self._last_step_express = False
+        # Streams that already had a chunk scheduled; the rest await their first.
+        self._chunk_started: set[str] = set()
+        # Optional guard: take an express step only while every ready later
+        # chunk's stream still holds at least this much unplayed audio, so a
+        # loaded stage does not trade first packets for playback underruns.
+        # Playback is assumed to start with a stream's first emitted audio.
+        self._express_min_slack_s = float(os.environ.get("VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS_SLACK_S", "0") or 0)
+        # request id -> [monotonic time of first emitted audio, emitted seconds]
+        self._stream_audio: dict[str, list[float]] = {}
+        self._express_skipped_for_slack = 0
+        if self._first_chunk_express:
+            logger.info(
+                "Generation scheduler decodes first chunks in express steps (min continuation slack %.2f s)",
+                self._express_min_slack_s,
+            )
 
     def _requires_atomic_chunk(self) -> bool:
         adapter = self.chunk_transfer_adapter
@@ -113,25 +133,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 is_segment_finished=False,
             )
             self._pending_chunk_error_outputs.append((finished_request.client_index, error_output))
-
-    def _is_done_receiving_chunks(self, request_id: str) -> bool:
-        if self.chunk_transfer_adapter is not None:
-            return self.chunk_transfer_adapter.is_done_receiving_chunks(request_id)
-        coordinator = self.input_coordinator
-        return bool(self._native_data_plane and coordinator is not None and request_id in coordinator.finished_requests)
-
-    def _input_execution_is_terminal(
-        self,
-        request_id: str,
-        scheduler_output: SchedulerOutput,
-    ) -> bool:
-        if self._native_data_plane:
-            return request_id in getattr(
-                scheduler_output,
-                "input_terminal_req_ids",
-                set(),
-            )
-        return self._is_done_receiving_chunks(request_id)
 
     def _build_generation_scheduler_output(
         self,
@@ -318,16 +319,43 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._resync_streaming_input_counter()
         async_chunk_transport = self._async_chunk_transport_enabled()
         native_chunks = bool(getattr(self, "_native_data_plane", False) and async_chunk_transport)
+
         # Parking releases an execution slot, but stateful codecs retain their
         # request-owned state until completion or abort, in either runner.
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if self._retains_state_across_chunks else 0
         )
 
-        # OMNI: Track requests that are already finished (e.g., marked by connector)
+        # OMNI: Track requests that are already finished (e.g., marked by connector).
         # These should be removed from running and not scheduled.
         already_finished_reqs: set[Request] = set()
-        while req_index < len(self.running) and token_budget > 0 and len(num_scheduled_tokens) < execution_batch_size:
+
+        # An express step isolates first chunks from ready continuations.
+        # Two express steps never run back to back; the optional slack guard
+        # requires playback headroom before delaying a continuation.
+        first_chunk_express = getattr(self, "_first_chunk_express", False)
+        express = (
+            first_chunk_express
+            and native_chunks
+            and not self._last_step_express
+            and any(
+                r.request_id not in self._chunk_started
+                and r.num_in_flight_tokens == 0
+                and len(r.prompt_token_ids) > r.num_computed_tokens
+                for r in self.waiting
+            )
+        )
+        if express and getattr(self, "_express_min_slack_s", 0) > 0 and not self._continuations_have_slack():
+            express = False
+        if first_chunk_express:
+            self._last_step_express = express
+
+        while (
+            not express
+            and req_index < len(self.running)
+            and token_budget > 0
+            and len(num_scheduled_tokens) < execution_batch_size
+        ):
             request = self.running[req_index]
 
             # OMNI: Skip requests that are not in self.requests.
@@ -419,6 +447,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             request = self.waiting.peek_request()
 
+            if express and request.request_id in self._chunk_started:
+                self.waiting.pop_request()
+                skipped_waiting_requests.add_request(request)
+                continue
+
             if native_chunks and request.num_in_flight_tokens > 0:
                 # A restored waiting entry can still own an outstanding batch.
                 # Do not let it block other ready streams or execute it twice.
@@ -499,6 +532,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             scheduled_new_reqs.append(request)
+
+        if first_chunk_express:
+            self._chunk_started.update(num_scheduled_tokens)
 
         # Return skipped waiting requests.
         if skipped_waiting_requests:
@@ -599,9 +635,52 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
+    def _continuations_have_slack(self) -> bool:
+        """Whether every started stream with a chunk ready to decode can wait one express step."""
+        now = time.monotonic()
+        for request in (*self.running, *self.waiting):
+            if request.request_id not in self._chunk_started or request.num_in_flight_tokens > 0:
+                continue
+            if len(request.prompt_token_ids) <= request.num_computed_tokens:
+                continue
+            audio = self._stream_audio.get(request.request_id)
+            if audio is None:
+                # No known playback credit: do not delay this continuation.
+                return False
+            if audio[0] + audio[1] - now < self._express_min_slack_s:
+                self._express_skipped_for_slack += 1
+                if self._express_skipped_for_slack in (1, 100, 10000):
+                    logger.info(
+                        "First-chunk express deferred: a stream holds under %.2f s of audio (%d times)",
+                        self._express_min_slack_s,
+                        self._express_skipped_for_slack,
+                    )
+                return False
+        return True
+
+    def _record_stream_audio(self, request_id: str, mm_output: Any) -> None:
+        """Accumulate the seconds of audio each stream has emitted (``model_outputs`` at ``sr``)."""
+        if not isinstance(mm_output, dict):
+            return
+        audio = mm_output.get("model_outputs")
+        rate = mm_output.get("sr")
+        # Only mono sample vectors have an unambiguous duration here.
+        # Unknown/multichannel layouts earn no slack credit.
+        if not isinstance(audio, torch.Tensor) or audio.ndim != 1 or audio.numel() == 0:
+            return
+        if isinstance(rate, torch.Tensor):
+            rate = int(rate.reshape(-1)[0]) if rate.numel() else 0
+        if not isinstance(rate, int) or rate <= 0:
+            return
+        entry = self._stream_audio.setdefault(request_id, [time.monotonic(), 0.0])
+        entry[1] += audio.numel() / rate
+
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if getattr(self, "_first_chunk_express", False):
+            self._chunk_started.discard(request.request_id)
+            getattr(self, "_stream_audio", {}).pop(request.request_id, None)
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
@@ -751,6 +830,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             ec_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
+            if getattr(self, "_express_min_slack_s", 0) > 0 and self._first_chunk_express:
+                self._record_stream_audio(req_id, mm_output)
             status_before_stop = request.status
             finish_reason = None
             is_segment_finished = False

@@ -73,6 +73,9 @@ class FakeKV:
     def take_new_block_ids(self):
         return []
 
+    def take_boundary_state_offloads(self):
+        return {}
+
 
 class FakeAdapter:
     """Minimal chunk-receiving adapter honoring the ready-chunk contract.
@@ -146,11 +149,18 @@ def _make_scheduler(
     sched.finished_req_ids_dict = {}
     sched.connector = None
     sched.ec_connector = None
-    sched.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
+    sched.encoder_cache_manager = SimpleNamespace(
+        get_freed_mm_hashes=lambda: [],
+        get_manager_metadata=lambda: None,
+    )
     sched.needs_kv_cache_zeroing = False
     sched.log_stats = False
     sched.perf_metrics = None
     sched.num_lookahead_tokens = 0
+    # __new__ bypasses the vLLM constructor; this fixture uses no spec decode.
+    sched.num_spec_tokens = 0
+    sched.dynamic_sd_lookup = None
+    sched.reset_preempted_req_ids = set()
     sched.num_waiting_for_streaming_input = 0
     sched._retains_state_across_chunks = False
     sched._pause_state = PauseState.UNPAUSED
