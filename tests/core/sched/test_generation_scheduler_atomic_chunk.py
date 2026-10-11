@@ -138,16 +138,20 @@ def _make_scheduler(
     sched.use_pp = False
     sched.max_num_scheduled_tokens = budget
     sched.max_num_running_reqs = max_num_seqs
+    sched.max_num_active_reqs = max_num_seqs
     sched.kv_cache_manager = FakeKV(fail_allocation=fail_allocation)
     sched.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
     sched.policy = SchedulingPolicy.FCFS
     sched.waiting = create_request_queue(sched.policy)
+    sched.kv_holding_waiting = create_request_queue(sched.policy)
+    sched.deferred_waiting = set()
     sched.skipped_waiting = create_request_queue(sched.policy)
     sched.running = []
     sched.requests = {}
     sched.finished_req_ids = set()
     sched.finished_req_ids_dict = {}
     sched.connector = None
+    sched.aux_output_connector = None
     sched.ec_connector = None
     sched.encoder_cache_manager = SimpleNamespace(
         get_freed_mm_hashes=lambda: [],
@@ -167,6 +171,7 @@ def _make_scheduler(
     sched._pending_finish_reqs = []
     sched._pending_chunk_error_outputs = []
     sched._latest_omni_connector_output = None
+    sched._native_data_plane = False
     sched.input_coordinator = None
     sched.use_v2_model_runner = False
     sched.async_scheduling = False
@@ -196,6 +201,8 @@ def _make_scheduler(
             if request in sched.running:
                 sched.running.remove(request)
             sched.waiting.remove_requests([request])
+            sched.kv_holding_waiting.remove_requests([request])
+            sched.deferred_waiting.discard(request)
             sched.chunk_transfer_adapter.requests_with_ready_chunks.discard(req_id)
             finished.append(request)
         return finished
@@ -219,10 +226,10 @@ def _make_request(request_id: str, num_tokens: int) -> Request:
     return request
 
 
-def _stage_waiting_chunk(sched, request: Request) -> None:
+def _stage_waiting_chunk(sched, request: Request, queue_name: str = "waiting") -> None:
     """Register a request whose full chunk has been committed by the adapter."""
     sched.requests[request.request_id] = request
-    sched.waiting.add_request(request)
+    getattr(sched, queue_name).add_request(request)
     sched.chunk_transfer_adapter.requests_with_ready_chunks.add(request.request_id)
 
 
@@ -249,11 +256,12 @@ def _make_runner_output():
 
 class TestWaitingDefersWholeChunk:
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    def test_57th_first_chunk_deferred_intact(self, enable_chunked_prefill):
+    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting"])
+    def test_57th_first_chunk_deferred_intact(self, enable_chunked_prefill, queue_name):
         sched = _make_scheduler(enable_chunked_prefill=enable_chunked_prefill)
         requests = [_make_request(f"speech-{i}", FIRST_CHUNK_TOKENS) for i in range(57)]
         for request in requests:
-            _stage_waiting_chunk(sched, request)
+            _stage_waiting_chunk(sched, request, queue_name)
 
         output = sched.schedule()
 
@@ -268,11 +276,20 @@ class TestWaitingDefersWholeChunk:
         # Intact data, still queued, still ready, still tracked.
         assert len(deferred.prompt_token_ids) == FIRST_CHUNK_TOKENS
         assert deferred.request_id in sched.requests
-        assert sched.waiting.peek_request() is deferred
+        assert getattr(sched, queue_name).peek_request() is deferred
         assert deferred.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks
         assert len(sched.running) == 56
         # Only the scheduled chunks lose their ready marker (clear-on-schedule).
         assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {deferred.request_id}
+
+        # Complete the admitted chunks; the deferred chunk must remain usable
+        # and be admitted whole on the next step from either waiting queue.
+        for request in requests[:56]:
+            request.num_computed_tokens = FIRST_CHUNK_TOKENS
+        next_output = sched.schedule()
+        assert next_output.num_scheduled_tokens == {deferred.request_id: FIRST_CHUNK_TOKENS}
+        assert not getattr(sched, queue_name)
+        assert deferred.request_id not in sched.chunk_transfer_adapter.requests_with_ready_chunks
 
     def test_exact_fit_chunk_is_scheduled_whole(self):
         sched = _make_scheduler(budget=FIRST_CHUNK_TOKENS)
@@ -399,22 +416,37 @@ class TestOversizedRejected:
         errored_ids = {error_output.request_id for _, error_output in sched._pending_chunk_error_outputs}
         assert errored_ids == {oversized_a.request_id, oversized_b.request_id}
 
-    def test_nonzero_client_index_routing(self):
+    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting"])
+    def test_nonzero_client_index_routing(self, queue_name):
         sched = _make_scheduler()
         oversized = _make_request("client-2-oversized", OVERSIZED_TOKENS)
         oversized.client_index = 2
-        _stage_waiting_chunk(sched, oversized)
+        _stage_waiting_chunk(sched, oversized, queue_name)
 
         output = sched.schedule()
 
         # Finished IDs and the queued output must follow the request's own
         # client index, not a hardcoded one.
         assert sched.finished_req_ids_dict == {2: {oversized.request_id}}
+        assert oversized.request_id not in sched.requests
+        assert oversized not in getattr(sched, queue_name)
+        assert oversized.request_id not in sched.chunk_transfer_adapter.requests_with_ready_chunks
         client_index, error_output = sched._pending_chunk_error_outputs[0]
         assert client_index == 2
         result = sched.update_from_output(output, _make_runner_output())
         assert oversized.request_id in result[2].finished_requests
+        assert len(result[2].outputs) == 1
+        assert result[2].outputs[0].finish_reason == FinishReason.ERROR
+        assert sched._pending_chunk_error_outputs == []
         assert 0 not in result
+
+        # Finishing a KV holder must remove its queue entry as well, so the
+        # next zero-token step neither rejects nor emits the request again.
+        next_output = sched.schedule()
+        assert not next_output.num_scheduled_tokens
+        result_again = sched.update_from_output(next_output, _make_runner_output())
+        assert not result_again.get(2) or result_again[2].outputs == []
+        assert len(sched.chunk_transfer_adapter.finish_calls) == 1
 
     @pytest.mark.parametrize("budget,chunk_tokens", [(1152, FIRST_CHUNK_TOKENS), (1000, FIRST_CHUNK_TOKENS)])
     def test_boundary_budgets_reject_never_slice(self, budget, chunk_tokens):
