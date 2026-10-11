@@ -987,12 +987,11 @@ async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orc
 
 
 @pytest.mark.asyncio
-async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orchestrator_factory) -> None:
+async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orchestrator_factory, mocker) -> None:
     """An oversized-chunk ERROR terminal reaches the client as an error.
 
-    Regression for the raw-terminal fallback that used to replace
-    ``FinishReason.ERROR`` and its ``stop_reason`` with an empty successful
-    STOP output.
+    The unified stage-error handler must preserve the scheduler rejection
+    before normal terminal finishing can emit an empty successful output.
     """
     request_id = "req-stream-error-terminal"
     reason = "async chunk requires 65552 tokens, but max_num_scheduled_tokens is 65536"
@@ -1003,6 +1002,7 @@ async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orches
         output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
         async_chunk=True,
     )
+    handle_stage_error = mocker.spy(orchestrator_fixture.orchestrator, "_handle_stage_error")
     request = FakePromptRequest(
         request_id=request_id,
         prompt_token_ids=[1, 2, 3, 4],
@@ -1019,7 +1019,8 @@ async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orches
         )
 
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
-        stage1.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
+        raw_outputs = _error_engine_core_outputs(request_id, reason)
+        stage1.push_engine_core_outputs(raw_outputs)
 
         error_msg = await _get_error_message(orchestrator_fixture)
 
@@ -1027,9 +1028,13 @@ async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orches
         assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 1, reason)
         assert error_msg.fatal is False
         await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        handle_stage_error.assert_awaited_once_with(1, raw_outputs.outputs[0], error=reason)
         # abort=True cleanup reached every stage holding the request.
         assert stage0.abort_calls == [[request_id]]
         assert stage1.abort_calls == [[request_id]]
+        assert all(
+            pool.get_bound_replica_id(request_id) is None for pool in orchestrator_fixture.orchestrator.stage_pools
+        )
         await asyncio.sleep(0.05)
         with pytest.raises(queue.Empty):
             orchestrator_fixture.output_sync_q.get_nowait()
@@ -1074,8 +1079,8 @@ async def test_async_chunk_raw_terminal_error_multi_final_stage_fails_fast(orche
         # Only stage-1 terminates, with ERROR; stage-2 never finishes.
         stage1.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
 
-        # Without fail-fast the fallback would wait for stage-2 forever and
-        # this get would time out.
+        # Normal terminal finishing would wait for stage-2 forever without
+        # the earlier unified error handler, and this get would time out.
         error_msg = await _get_error_message(orchestrator_fixture)
 
         assert isinstance(error_msg, ErrorMessage)
@@ -2235,7 +2240,17 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage_id", [0, 1])
-async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(mocker, stage_id):
+@pytest.mark.parametrize(
+    ("reason", "expected_error"),
+    [
+        ("Timed out waiting for connector input after 5s", "Timed out waiting for connector input after 5s"),
+        (None, "Stage request failed"),
+        ("", "Stage request failed"),
+        (17, "Stage request failed"),
+    ],
+    ids=["reason", "missing-reason", "empty-reason", "non-string-reason"],
+)
+async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(mocker, stage_id, reason, expected_error):
     pools = _build_stage_pools([[FakeStageClient()], [FakeStageClient()]])
     for pool in pools:
         mocker.patch.object(pool, "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[])
@@ -2253,7 +2268,6 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
     normal_terminal = mocker.patch.object(
         orchestrator, "_apply_raw_terminal_stage_finish", new_callable=mocker.AsyncMock
     )
-    reason = "Timed out waiting for connector input after 5s"
     raw = EngineCoreOutputs(
         outputs=[
             OmniEngineCoreOutput(
@@ -2261,16 +2275,17 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
             )
         ]
     )
-    terminal_outputs: dict[str, Any] = {}
+    terminal_request_ids: set[str] = set()
 
-    await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal_outputs)
+    await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal_request_ids)
 
     error = output_queue.get_nowait()
     assert isinstance(error, ErrorMessage)
-    assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, reason)
+    assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, expected_error)
+    assert error.fatal is False
     cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True)
     normal_terminal.assert_not_awaited()
-    assert not terminal_outputs
+    assert not terminal_request_ids
     assert output_queue.empty()
 
 

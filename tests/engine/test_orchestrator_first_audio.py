@@ -75,7 +75,7 @@ def _orchestrator(output_kind=RequestOutputKind.DELTA, *, registered=True, repli
     obj._finish_raw_terminal_requests = AsyncMock()
 
     async def process(stage, replica, raw, terminals):
-        assert isinstance(terminals, dict)
+        assert isinstance(terminals, set)
         await obj._route_upstream_first_audio(stage, replica, raw)
         return await obj.stage_pools[stage].process_llm_raw_outputs(replica, raw)
 
@@ -117,7 +117,7 @@ def _raw(*, first=False, required=False, terminal=False, samples=(1, 1, 1, 1)):
 
 async def _codec_output(obj, raw):
     replica = obj.stage_pools[1].replica_id
-    processed = await obj._process_llm_stage_outputs(1, replica, raw, {})
+    processed = await obj._process_llm_stage_outputs(1, replica, raw, set())
     await obj._handle_processed_outputs(1, replica, processed)
 
 
@@ -186,16 +186,15 @@ async def test_first_audio_waits_for_codec_registration_and_ignores_duplicates()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", [False, True])
-async def test_first_audio_flush_uses_dict_with_real_raw_terminal_handlers(terminal):
+async def test_first_audio_flush_uses_set_with_real_raw_terminal_handlers(terminal):
     obj = _orchestrator()
     req_state = obj.request_states["r"]
     codec_output = _raw(required=True, terminal=terminal, samples=(30, 31))
-    eco = codec_output.outputs[0]
     await _codec_output(obj, codec_output)
     assert len(req_state.pending_first_audio_outputs) == 1
     assert obj.output_async_queue.empty()
 
-    # Exercise both dictionary writes and .items() in the production handlers.
+    # Exercise request-id collection and iteration in the production handlers.
     obj._prom_metrics = None
     obj._stat_logger = None
     obj._handle_kv_ready_raw_outputs = AsyncMock()
@@ -209,8 +208,8 @@ async def test_first_audio_flush_uses_dict_with_real_raw_terminal_handlers(termi
     obj._finish_raw_terminal_requests.assert_awaited_once()
     stage, replica, terminals = obj._finish_raw_terminal_requests.await_args.args
     assert (stage, replica) == (1, 2)
-    assert isinstance(terminals, dict)
-    assert terminals == ({"r": eco} if terminal else {})
+    assert isinstance(terminals, set)
+    assert terminals == ({"r"} if terminal else set())
     assert req_state.pending_first_audio_outputs == []
     messages = _messages(obj)
     assert [_audio(message.engine_outputs).tolist() for message in messages] == [[10, 11], [30, 31]]
