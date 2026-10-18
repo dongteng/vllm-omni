@@ -39,17 +39,17 @@ With `async_chunk`:
 4. **Non-blocking Scheduler**: Requests waiting for chunks don't block the entire scheduler
 5. **Code2Wav Batch Inference**: Supports batched processing in code2wav stage
 
-| Input       | Output             | Async_chunk enabled   | Code2Wav batch size   | Max_Concurrency  | Prompts   | Mean E2E     | Mean TTFT    | Mean TPOT   | Mean TTFP     | Mean RTF   | Mean ITL   |
-| ----------- | ------------------ | --------------------- | --------------------- | ---------------- | --------- | ------------ | ------------ | ----------- | ------------- | ---------- | ---------- |
-| text 100    | text 100+audio     | False                 | 1                     | 1                | 50        | 6581.80      | 43.22        | 8.31        | 6459.34       | 0.24       | 8.22       |
-| text 100    | text 100+audio     | False                 | 1                     | 4                | 50        | 7398.63      | 67.57        | 9.14        | 7285.35       | 0.27       | 9.05       |
-| text 100    | text 100+audio     | False                 | 1                     | 10               | 50        | 13522.99     | 131.82       | 12.72       | 13410.44      | 0.49       | 12.60      |
-| text 100    | text 100+audio     | False                 | 64                    | 1                | 50        | 6505.13      | 43.14        | 8.52        | 6395.40       | 0.24       | 8.44       |
-| text 100    | text 100+audio     | False                 | 64                    | 4                | 50        | 7668.15      | 51.15        | 9.36        | 7562.37       | 0.28       | 9.27       |
-| text 100    | text 100+audio     | False                 | 64                    | 10               | 50        | 9516.18      | 138.06       | 14.75       | 9409.26       | 0.34       | 14.60      |
-| text 100    | text 100+audio     | True                  | 1                     | 1                | 50        | 6179.79      | 44.58        | 8.69        | 522.99        | 0.22       | 8.60       |
-| text 100    | text 100+audio     | True                  | 1                     | 4                | 50        | 7692.69      | 103.96       | 10.22       | 785.85        | 0.29       | 10.12      |
-| text 100    | text 100+audio     | True                  | 1                     | 10               | 50        | 11152.71     | 685.60       | 17.64       | 1628.88       | 0.41       | 17.62      |
+| Input | Output | Async_chunk enabled | Code2Wav batch size | Max_Concurrency | Prompts | Mean E2E | Mean TTFT | Mean TPOT | Mean TTFP | Mean RTF | Mean ITL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| text 100 | text 100+audio | False | 1 | 1 | 50 | 6581.80 | 43.22 | 8.31 | 6459.34 | 0.24 | 8.22 |
+| text 100 | text 100+audio | False | 1 | 4 | 50 | 7398.63 | 67.57 | 9.14 | 7285.35 | 0.27 | 9.05 |
+| text 100 | text 100+audio | False | 1 | 10 | 50 | 13522.99 | 131.82 | 12.72 | 13410.44 | 0.49 | 12.60 |
+| text 100 | text 100+audio | False | 64 | 1 | 50 | 6505.13 | 43.14 | 8.52 | 6395.40 | 0.24 | 8.44 |
+| text 100 | text 100+audio | False | 64 | 4 | 50 | 7668.15 | 51.15 | 9.36 | 7562.37 | 0.28 | 9.27 |
+| text 100 | text 100+audio | False | 64 | 10 | 50 | 9516.18 | 138.06 | 14.75 | 9409.26 | 0.34 | 14.60 |
+| text 100 | text 100+audio | True | 1 | 1 | 50 | 6179.79 | 44.58 | 8.69 | 522.99 | 0.22 | 8.60 |
+| text 100 | text 100+audio | True | 1 | 4 | 50 | 7692.69 | 103.96 | 10.22 | 785.85 | 0.29 | 10.12 |
+| text 100 | text 100+audio | True | 1 | 10 | 50 | 11152.71 | 685.60 | 17.64 | 1628.88 | 0.41 | 17.62 |
 
 Performance data collected on H800 GPUs through comprehensive benchmarking with cudagraph enabled. text input uses random dataset.
 
@@ -91,12 +91,12 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 
 **Diagram Legend:**
 
-| Step      | Stage Type     | Description                                 |
-| --------- | -------------- | ------------------------------------------- |
+| Step | Stage Type | Description |
+| --- | --- | --- |
 | `prefill` | Initialization | Context processing, KV cache initialization |
-| `decode`  | Autoregressive | Token-by-token generation in AR stages      |
-| `codes`   | Audio Encoding | RVQ codec codes from Talker stage           |
-| `output`  | Final Output   | Text chunks or audio waveforms              |
+| `decode` | Autoregressive | Token-by-token generation in AR stages |
+| `codes` | Audio Encoding | RVQ codec codes from Talker stage |
+| `output` | Final Output | Text chunks or audio waveforms |
 
 ### Data Flow
 
