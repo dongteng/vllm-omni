@@ -198,7 +198,11 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
     scheduler._native_data_plane = True
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = SimpleNamespace(
-        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
+        _async_chunk=True,
+        _stage_id=1,
+        requests_with_ready_chunks=set(),
+        finished_requests=set(),
+        restore_queues=lambda *args, **kwargs: None,
     )
     scheduler.running = []
     scheduler.waiting = create_request_queue(scheduler.policy)
@@ -380,7 +384,11 @@ def _express_scheduler():
     scheduler._native_data_plane = True
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = SimpleNamespace(
-        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
+        _async_chunk=True,
+        _stage_id=1,
+        requests_with_ready_chunks=set(),
+        finished_requests=set(),
+        restore_queues=lambda *args, **kwargs: None,
     )
     scheduler._first_chunk_express = True
     scheduler._last_step_express = False

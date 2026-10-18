@@ -14,6 +14,7 @@ from vllm.v1.request import Request
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.core.sched import omni_scheduler_mixin
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
@@ -118,6 +119,9 @@ def test_native_data_plane_uses_the_selected_input_protocol(async_chunk, stage_i
         assert scheduler.input_coordinator is None
     assert scheduler._async_chunk_transport_enabled() is async_chunk
     assert scheduler.chunk_transfer_adapter is None
+    # Stage zero can own an async coordinator for bookkeeping without
+    # receiving connector chunks. Full-payload inputs are not atomic chunks.
+    assert OmniGenerationScheduler._requires_atomic_chunk(scheduler) is (async_chunk and stage_id > 0)
 
 
 def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
@@ -237,3 +241,5 @@ def test_native_downstream_sender_stage_does_not_wait_for_chunks(role, coordinat
     assert scheduler._native_data_plane
     assert (scheduler.input_coordinator is not None) is coordinated
     assert scheduler._async_chunk_transport_enabled() is coordinated
+    assert scheduler.chunk_transfer_adapter is None
+    assert OmniGenerationScheduler._requires_atomic_chunk(scheduler) is coordinated
