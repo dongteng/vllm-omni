@@ -8,6 +8,7 @@ from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # Bind Request and RequestStatus only after Omni installs its vLLM patches.
 # isort: off
@@ -124,11 +125,15 @@ def test_generation_free_request_cleans_input_coordinator(monkeypatch: pytest.Mo
 
 
 @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting", "running"])
-def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(mocker, queue_name: str) -> None:
+@pytest.mark.parametrize("in_flight_tokens", [0, 8])
+def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(
+    mocker, queue_name: str, in_flight_tokens: int
+) -> None:
     """Exercise actual scheduler/coordinator cleanup, stubbing only cache I/O."""
     request = Request("oversized-native", [0] * 9, SamplingParams(max_tokens=4), pooling_params=None)
     request.client_index = 4
     request.resumable = True
+    request.num_in_flight_tokens = in_flight_tokens
     request.status = RequestStatus.RUNNING if queue_name == "running" else RequestStatus.WAITING
     healthy = Request("healthy-native", [0], SamplingParams(max_tokens=4), pooling_params=None)
 
@@ -172,15 +177,58 @@ def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(moc
     scheduler.defer_block_free = False
     kv_cache = mocker.Mock(spec=KVCacheManager)
     kv_cache.take_events.return_value = []
+    kv_cache.estimate_cached_tokens.return_value = 0
     scheduler.kv_cache_manager = kv_cache
     encoder_cache = mocker.Mock(spec=EncoderCacheManager)
     scheduler.encoder_cache_manager = encoder_cache
     scheduler._pending_request_prewarms = {request.request_id: {}, healthy.request_id: {}}
     scheduler._pending_chunk_error_outputs = []
     scheduler._pending_finish_reqs = []
+    scheduler._pooling_output_decoder = None
     scheduler.log_stats = False
     scheduler.perf_metrics = None
     scheduler._last_stats_time = time.monotonic()
+
+    if in_flight_tokens:
+        scheduler._reject_oversized_ready_chunks()
+
+        assert scheduler.requests[request.request_id] is request
+        assert request in getattr(scheduler, queue_name)
+        assert request.request_id in coordinator.requests_with_ready_chunks
+        assert not request.is_finished()
+        assert request.stop_reason is None
+        assert scheduler.finished_req_ids == set()
+        assert scheduler._pending_chunk_error_outputs == []
+        kv_cache.free.assert_not_called()
+        encoder_cache.free.assert_not_called()
+
+        # Return the prior valid audio through the actual update path, rather
+        # than manually clearing the in-flight counter before rejection.
+        audio_payload = {"audio": torch.tensor([0.25, -0.5])}
+        previous_step = SchedulerOutput.make_empty()
+        previous_step.num_scheduled_tokens = {request.request_id: in_flight_tokens}
+        previous_step.total_num_scheduled_tokens = in_flight_tokens
+        previous_output = OmniModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            pooler_output=[],
+            multimodal_outputs=[audio_payload],
+        )
+
+        previous_result = scheduler.update_from_output(previous_step, previous_output)
+
+        [audio_output] = previous_result[request.client_index].outputs
+        assert audio_output.request_id == request.request_id
+        assert audio_output.multimodal_output is audio_payload
+        assert audio_output.finish_reason is None
+        assert not previous_result[request.client_index].finished_requests
+        assert request.num_in_flight_tokens == 0
+        assert scheduler.requests[request.request_id] is request
+        assert request.request_id in coordinator.requests_with_ready_chunks
+        assert scheduler._pending_chunk_error_outputs == []
+        kv_cache.free.assert_not_called()
+        encoder_cache.free.assert_not_called()
 
     scheduler._reject_oversized_ready_chunks()
 

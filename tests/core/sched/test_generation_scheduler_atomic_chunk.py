@@ -642,6 +642,48 @@ class TestOversizedRejected:
 
 class TestNativeInFlightFence:
     @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting", "running"])
+    def test_oversized_chunk_waits_for_in_flight_execution_without_blocking_other_stream(self, queue_name):
+        sched = _make_scheduler(receive_path="native", budget=FOLLOWUP_TOKENS, enable_chunked_prefill=True)
+        oversized = _make_request("in-flight-oversized", FOLLOWUP_TOKENS + 16)
+        oversized.num_in_flight_tokens = FOLLOWUP_TOKENS
+        oversized.additional_information = {"is_first_chunk": False}
+        expected_codes = list(oversized.prompt_token_ids)
+        ready = _make_request("other-stream", FOLLOWUP_TOKENS)
+        for request in (oversized, ready):
+            if queue_name == "running":
+                _stage_running_chunk(sched, request)
+            else:
+                _stage_waiting_chunk(sched, request, queue_name)
+
+        output = sched.schedule()
+
+        assert output.num_scheduled_tokens == {ready.request_id: FOLLOWUP_TOKENS}
+        assert sched.requests[oversized.request_id] is oversized
+        assert oversized in getattr(sched, queue_name)
+        assert oversized.request_id in _ready_chunk_ids(sched)
+        assert oversized.prompt_token_ids == expected_codes
+        assert oversized.additional_information == {"is_first_chunk": False}
+        assert oversized.num_in_flight_tokens == FOLLOWUP_TOKENS
+        assert oversized.stop_reason is None
+        assert sched.finish_calls == []
+        assert sched._pending_chunk_error_outputs == []
+
+        # Keep deferring while the previous execution owns the request.
+        ready.num_computed_tokens = FOLLOWUP_TOKENS
+        assert sched.schedule().num_scheduled_tokens == {}
+        assert oversized.request_id in _ready_chunk_ids(sched)
+        assert sched.finish_calls == []
+
+        # Actual output retirement is covered by the real-cleanup regression;
+        # here isolate admission after the native fence has cleared.
+        oversized.num_in_flight_tokens = 0
+        assert sched.schedule().num_scheduled_tokens == {}
+        assert oversized.request_id not in sched.requests
+        assert oversized.request_id not in _ready_chunk_ids(sched)
+        assert sched.finish_calls == [({oversized.request_id}, RequestStatus.FINISHED_ERROR)]
+        assert len(sched._pending_chunk_error_outputs) == 1
+
+    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting", "running"])
     def test_in_flight_chunk_keeps_ready_without_blocking_other_stream(self, queue_name):
         sched = _make_scheduler(receive_path="native", budget=FOLLOWUP_TOKENS, enable_chunked_prefill=True)
         in_flight = _make_request("in-flight", FOLLOWUP_TOKENS)
