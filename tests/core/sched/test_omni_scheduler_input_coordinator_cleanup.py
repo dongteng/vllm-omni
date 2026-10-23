@@ -186,6 +186,8 @@ def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(
     scheduler._pending_finish_reqs = []
     scheduler._pooling_output_decoder = None
     scheduler.log_stats = False
+    # Match vLLM 0.32 initialization with KV-fetch tracking disabled.
+    scheduler._kv_fetch_stages = None
     scheduler.perf_metrics = None
     scheduler._last_stats_time = time.monotonic()
 

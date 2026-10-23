@@ -277,8 +277,7 @@ def _stage_running_chunk(sched, request: Request) -> None:
 @pytest.mark.parametrize("queue_name", ["running", "waiting"])
 @pytest.mark.parametrize("native,pending", [(False, False), (False, True), (True, False)])
 def test_in_flight_guard_preserves_stateless_legacy_overlap(queue_name, native, pending):
-    sched = _make_scheduler(budget=32)
-    sched._native_data_plane = native
+    sched = _make_scheduler(receive_path="native" if native else "legacy", budget=32)
     sched._supports_pending_generation = pending
     sched.async_scheduling = True
     sched.scheduler_config.async_scheduling = True
